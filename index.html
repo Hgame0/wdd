@@ -27,26 +27,32 @@
       const msg = (t) => ($("msg").textContent = t);
       const b64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 
-      function openDb() {
-        return new Promise((resolve, reject) => {
-          const req = indexedDB.open("wudidong-lock", 1);
-          req.onupgradeneeded = () => req.result.createObjectStore("k");
-          req.onsuccess = () => resolve(req.result);
-          req.onerror = () => reject(req.error);
-        });
+      /** 密钥只由 Service Worker 保管：登录页把密钥交给它，收到确认后才跳转 */
+      async function worker() {
+        const reg = await navigator.serviceWorker.ready;
+        const next = reg.installing || reg.waiting;
+        if (next) {
+          await new Promise((resolve) => {
+            next.addEventListener("statechange", () => next.state === "activated" && resolve());
+            setTimeout(resolve, 5000);
+          });
+        }
+        return reg.active;
       }
-      async function idb(mode, fn) {
-        const db = await openDb();
+      async function ask(message, transfer = []) {
+        const sw = await worker();
         return new Promise((resolve) => {
-          const req = fn(db.transaction("k", mode).objectStore("k"));
-          req.onsuccess = () => resolve(req.result ?? null);
-          req.onerror = () => resolve(null);
+          const ch = new MessageChannel();
+          const timer = setTimeout(() => resolve({ ok: false, error: "后台脚本无响应，请刷新页面重试" }), 8000);
+          ch.port1.onmessage = (e) => {
+            clearTimeout(timer);
+            resolve(e.data);
+          };
+          sw.postMessage(message, [ch.port2, ...transfer]);
         });
       }
 
-      async function enter() {
-        const reg = await navigator.serviceWorker.ready;
-        reg.active.postMessage("key-changed");
+      function enter() {
         const params = new URLSearchParams(location.search);
         params.delete("locked");
         const query = params.toString();
@@ -55,21 +61,16 @@
 
       async function unlock(password) {
         const meta = await (await fetch("meta.json", { cache: "no-store" })).json();
-        const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveKey"]);
-        const key = await crypto.subtle.deriveKey(
-          { name: "PBKDF2", hash: "SHA-256", salt: b64(meta.salt), iterations: meta.iterations },
-          base,
-          { name: "AES-GCM", length: 256 },
-          false,
-          ["decrypt"],
-        );
+        const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
+        const raw = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: b64(meta.salt), iterations: meta.iterations }, base, 256);
+        const key = await crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["decrypt"]);
         const check = b64(meta.check);
         try {
           await crypto.subtle.decrypt({ name: "AES-GCM", iv: check.slice(0, 12) }, key, check.slice(12));
         } catch {
           return null;
         }
-        return key;
+        return raw;
       }
 
       const supported = "serviceWorker" in navigator && window.isSecureContext;
@@ -78,24 +79,30 @@
         if (!supported) return;
         $("go").disabled = true;
         msg("验证中…");
-        const key = await unlock($("pw").value);
-        if (!key) {
+        const raw = await unlock($("pw").value);
+        if (!raw) {
           msg("密码错误");
           $("go").disabled = false;
           return;
         }
-        await idb("readwrite", (s) => s.put(key, "key"));
+        const r = await ask({ type: "set-key", raw }, [raw]);
+        if (!r.ok) {
+          msg("保存登录状态失败：" + (r.error ?? "未知错误"));
+          $("go").disabled = false;
+          return;
+        }
         enter();
       });
 
+      const reasons = { nokey: "登录状态没有保存下来，请再输入一次密码", badkey: "密码已更换，请输入新密码" };
       if (!supported) {
         msg("此浏览器不支持（需要 HTTPS 与 Service Worker）");
         $("go").disabled = true;
       } else {
-        navigator.serviceWorker.register("sw.js");
-        const locked = new URLSearchParams(location.search).has("locked");
-        if (locked) msg("请重新输入密码");
-        else idb("readonly", (s) => s.get("key")).then((key) => key && enter());
+        navigator.serviceWorker.register("sw.js", { updateViaCache: "none" }).then((reg) => reg.update().catch(() => {}));
+        const locked = new URLSearchParams(location.search).get("locked");
+        if (locked !== null) msg(reasons[locked] ?? "请重新输入密码");
+        else ask({ type: "has-key" }).then((r) => r.ok && enter());
       }
     </script>
   </body>

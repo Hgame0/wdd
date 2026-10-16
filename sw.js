@@ -1,4 +1,4 @@
-/* 解密 Service Worker：game.html、lib/*、res/* 从 enc/ 取密文，用 IndexedDB 中的密钥解密后返回 */
+/* 解密 Service Worker：唯一持有密钥。game.html、lib/*、res/* 从 enc/ 取密文，解密后返回 */
 const scope = self.registration.scope;
 const scopePath = new URL(scope).pathname;
 const TYPES = {
@@ -17,28 +17,56 @@ const TYPES = {
 
 function openDb() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open("wudidong-lock", 1);
+    const req = indexedDB.open("wudidong-lock2", 1);
     req.onupgradeneeded = () => req.result.createObjectStore("k");
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
 }
+/** 写操作等事务 complete 才返回，之后任何上下文都能读到 */
 async function idb(mode, fn) {
   const db = await openDb();
-  return new Promise((resolve) => {
-    const req = fn(db.transaction("k", mode).objectStore("k"));
-    req.onsuccess = () => resolve(req.result ?? null);
-    req.onerror = () => resolve(null);
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction("k", mode);
+    const req = fn(tx.objectStore("k"));
+    tx.oncomplete = () => resolve(req.result ?? null);
+    tx.onerror = tx.onabort = () => reject(tx.error);
   });
 }
 
-let keyPromise = null;
-const getKey = () => (keyPromise ??= idb("readonly", (s) => s.get("key")));
+const importKey = (raw) => crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["decrypt"]);
+let key = null;
+async function loadKey() {
+  if (key) return key;
+  const raw = await idb("readonly", (s) => s.get("raw")).catch(() => null);
+  if (raw) key = await importKey(raw);
+  return key;
+}
+async function forgetKey() {
+  key = null;
+  await idb("readwrite", (s) => s.delete("raw")).catch(() => null);
+}
 
 self.addEventListener("install", () => self.skipWaiting());
 self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim()));
 self.addEventListener("message", (e) => {
-  if (e.data === "key-changed") keyPromise = null;
+  const port = e.ports[0];
+  const d = e.data ?? {};
+  e.waitUntil(
+    (async () => {
+      try {
+        if (d.type === "set-key") {
+          await idb("readwrite", (s) => s.put(d.raw, "raw"));
+          key = await importKey(d.raw);
+          port?.postMessage({ ok: true });
+        } else if (d.type === "has-key") {
+          port?.postMessage({ ok: !!(await loadKey()) });
+        }
+      } catch (err) {
+        port?.postMessage({ ok: false, error: String(err) });
+      }
+    })(),
+  );
 });
 
 self.addEventListener("fetch", (e) => {
@@ -50,17 +78,14 @@ self.addEventListener("fetch", (e) => {
 });
 
 async function serve(rel, req, isPage) {
-  const locked = async () => {
-    keyPromise = null;
-    return isPage ? Response.redirect(scope + "?locked", 302) : new Response("locked", { status: 403 });
-  };
-  const key = await getKey();
-  if (!key) return locked();
+  const locked = (reason) => (isPage ? Response.redirect(scope + "?locked=" + reason, 302) : new Response("locked", { status: 403 }));
+  const k = await loadKey();
+  if (!k) return locked("nokey");
   const decrypt = async (cache) => {
     const res = await fetch(new URL("enc/" + rel, scope), { cache });
     if (!res.ok) return res.status;
     const buf = await res.arrayBuffer();
-    return crypto.subtle.decrypt({ name: "AES-GCM", iv: buf.slice(0, 12) }, key, buf.slice(12));
+    return crypto.subtle.decrypt({ name: "AES-GCM", iv: buf.slice(0, 12) }, k, buf.slice(12));
   };
   let plain;
   try {
@@ -70,8 +95,8 @@ async function serve(rel, req, isPage) {
     try {
       plain = await decrypt("reload");
     } catch {
-      await idb("readwrite", (s) => s.delete("key"));
-      return locked();
+      await forgetKey();
+      return locked("badkey");
     }
   }
   if (typeof plain === "number") return new Response(null, { status: plain });
